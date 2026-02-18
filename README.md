@@ -1,44 +1,54 @@
-# Guition Knob V1: ESP32-S3 Audio Line-Out "Bridge" Hack
+# Guition Knob V1: ESP32-S3 Audio Line-Out Bridge
 
-This repository contains the hardware modification details and firmware to enable audio output from the **ESP32-S3** to the onboard **Line-Out jack** on the Guition V1 Knob.
+This repository provides hardware modification details and firmware to enable audio routing from the **ESP32-S3** to the onboard **Line-Out jack** via the secondary ESP32 on the Guition V1 Knob.
 
-## The Problem
-The factory design of the Guition Knob V1 uses a dual-MCU setup that is... let's call it "unique":
-* **ESP32-S3:** Controls the UI, Display, and Haptic motor.
-* **Secondary ESP32:** Connected to the DAC (PCM5100A).
-* **The Issue:** The S3 (where your main application likely lives) has no direct physical connection to the DAC. In the stock configuration, the S3 handles the UI while the ESP32 handles BT/WiFi audio independently.
+## Hardware Architecture & Problem
+The Guition Knob V1 utilizes a dual-MCU architecture:
+* **Main MCU (ESP32-S3):** Interfaces with the display and haptic motor. This chip includes **PSRAM**, which is required for applications like Sendspin.
+* **Secondary MCU (ESP32):** Hardwired to the **PCM5100A DAC**. It lacks PSRAM.
+* **The Issue:** The ESP32-S3 has no direct physical connection to the DAC. In the factory configuration, the S3 handles the UI while the ESP32 handles BT/WiFi audio independently. Because the secondary chip lacks PSRAM, it cannot run the Sendspin application, and the S3 cannot natively output audio to the line-out jack.
 
-## The Solution: The "I2S Repeater" Hack
-By repurposing existing connections and adding a single hardware bridge, we can create a high-speed digital audio path from the S3 to the Line-Out jack.
+## Solution: I2S Repeater Bridge
+This modification establishes a digital audio path between the two processors, allowing the ESP32-S3 to act as the I2S Master and the secondary ESP32 to act as a transparent I2S repeater.
 
-1.  **Repurpose UART:** The existing UART communication lines between the two MCUs are reused as I2S **BCK** and **LRCK** lines.
-2.  **Hardware Bridge (The Mod):** By adding a single `0402` 0R resistor (or a simple solder bridge), we link **GPIO41 (S3)** to **GPIO2 (ESP32)**. This serves as the **I2S Data** line.
-3.  **Software Bridge:** The secondary ESP32 is flashed with a small "Repeater" sketch. It listens for I2S data on its input pins and immediately pipes it out to the DAC.
+1.  **Clock Synchronization:** The existing UART traces connecting the two MCUs are repurposed for I2S **BCK** and **LRCK**.
+2.  **Data Link (Hardware Mod):** A physical bridge is required to connect **GPIO41 (S3)** to **GPIO2 (ESP32)**. This provides the I2S Data (SD) line.
+3.  **Firmware Logic:** The secondary ESP32 runs firmware that initializes an I2S input port (from the S3) and pipes the data to an I2S output port (to the DAC).
 
-## Hardware Modification Detail
+## Hardware Modification
 
-Locate the empty resistor pads near the secondary ESP32. You need to bridge the pad to its neighbor to connect the S3's GPIO41 signal to the ESP32's GPIO2.
+The modification requires a 0R link or solder bridge on the unpopulated resistor pads near the secondary ESP32. This connects the S3 GPIO41 signal to the ESP32 GPIO2.
 
 | Macro View | Micro Detail (The Bridge) |
 | :---: | :---: |
 | ![Board Overview](./image_d80040.jpg) | ![Solder Bridge](./image_d8009b.jpg) |
 
-## Pin Mapping
+### Pin Mapping
 | Signal | ESP32-S3 (Source) | ESP32 (Repeater) |
 | :--- | :--- | :--- |
 | **I2S BCK** | Repurposed UART | Repurposed UART |
 | **I2S LRCK** | Repurposed UART | Repurposed UART |
 | **I2S DATA** | **GPIO41** | **GPIO2** (via Mod) |
 
-## Software Setup
+## Schematic References
+The following schematics outline the signal paths and interconnects used in this modification:
+* [Connector Pinouts](./1_CONN.png)
+* [Main S3 MCU & Display](./2_ESP32-S3(R8).png)
+* [DAC & Audio Output Path](./3_LCD.png)
+* [Secondary ESP32 & UART Interconnect](./4_ESP32_U4WDH.png)
+* [Power & USB Schematics](./JC3636K518_Power.png)
 
-### 1. Secondary ESP32 (The "Bridge")
-Flash the code found in `/repeater-firmware`. This code initializes two I2S ports:
-* **Input:** Receives data from the S3.
-* **Output:** Sends data to the PCM5100A.
+## Build Instructions
 
-### 2. Main ESP32-S3 (Your App)
-In your code (using ESP-ADF, AudioTools, or the standard I2S driver), set your I2S output pins to the repurposed UART pins and GPIO41 for Data.
+This project uses ESPHome to build and flash the firmware.
 
----
-*Found this useful? Feel free to star the repo!*
+### ESP32-S3 (Main Application)
+Run the following command from the **root project folder**:
+```bash
+esphome run sendspin.yaml```
+```
+ESP32 (Secondary Bridge)
+Run the following command from the companion-chip folder:
+
+```Bash
+esphome run sendspin-esp32.yaml```
