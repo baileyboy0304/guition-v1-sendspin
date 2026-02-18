@@ -26,8 +26,8 @@ The modification requires a 0R link or solder bridge on the unpopulated resistor
 ### Pin Mapping
 | Signal | ESP32-S3 (Source) | ESP32 (Repeater) |
 | :--- | :--- | :--- |
-| **I2S BCK** | Repurposed UART | Repurposed UART |
-| **I2S LRCK** | Repurposed UART | Repurposed UART |
+| **I2S BCK** | **GPIO40** | **GPIO23** |
+| **I2S LRCK** | **GPIO39** | **GPIO18** |
 | **I2S DATA** | **GPIO41** | **GPIO2** (via Mod) |
 
 ## Schematic References
