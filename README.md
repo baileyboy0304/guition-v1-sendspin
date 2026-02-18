@@ -45,10 +45,10 @@ This project uses ESPHome to build and flash the firmware.
 ### ESP32-S3 (Main Application)
 Run the following command from the **root project folder**:
 ```bash
-esphome run sendspin.yaml```
+esphome run sendspin.yaml
 ```
 ESP32 (Secondary Bridge)
 Run the following command from the companion-chip folder:
 
 ```Bash
-esphome run sendspin-esp32.yaml```
+esphome run sendspin-esp32.yaml
