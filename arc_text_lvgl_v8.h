@@ -483,9 +483,11 @@ static void layout_now() {
     stats_.glyphs = 0;
   }
 
-  // Re-point the LVGL image at the updated buffer and mark the widget dirty.
-  // LVGL will issue a single blit to the display on the next flush cycle.
-  lv_img_set_src(img_obj_, &img_dsc_);
+  // Mark the widget dirty so LVGL issues a single blit on the next flush cycle.
+  // lv_img_set_src() is intentionally NOT called here — the img_dsc_ pointer is
+  // set once in init() and never changes.  Calling set_src() on every update
+  // forces LVGL to re-layout the image widget, which corrupts the display along
+  // the horizontal seam between the two render passes produced by buffer_size: 50%.
   lv_obj_invalidate(img_obj_);
 
   const uint32_t dt     = micros() - t0;

@@ -492,7 +492,7 @@ image:
 lvgl:
   displays: [main_display]
   touchscreens: [my_touchscreen]
-  buffer_size: 50%
+  buffer_size: 100%
   color_depth: 16
   bg_color: 0x000000
 
