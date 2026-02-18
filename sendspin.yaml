@@ -146,6 +146,21 @@ globals:
     type: bool
     initial_value: "false"
 
+  # Track-change transition coordination flags.
+  # is_transitioning: set for the duration of the dark phase; gates on_image_decoded
+  #   and on_image_error from writing to the display mid-transition.
+  # pending_art_ready / pending_art_error: set by on_image_decoded / on_image_error
+  #   when they fire during a transition; consumed in the dark phase.
+  - id: is_transitioning
+    type: bool
+    initial_value: "false"
+  - id: pending_art_ready
+    type: bool
+    initial_value: "false"
+  - id: pending_art_error
+    type: bool
+    initial_value: "false"
+
 switch:
   - platform: template
     id: startup_sound_switch
@@ -200,22 +215,37 @@ generic_image:
     resize: 360x360
     image_source: ALBUM
     on_image_decoded:
-      - lvgl.image.update:
-          id: album_art_widget
-          src: sendspin_album_art
-      - lvgl.obj.update:
-          id: album_art_widget
-          hidden: false
-      - lvgl.obj.update:
-          id: placeholder_icon
-          hidden: true
+      - if:
+          condition:
+            lambda: "return id(is_transitioning);"
+          then:
+            # Screen is fading or dark — defer the display update so the new art
+            # only appears once the transition applies it in the dark phase.
+            - lambda: "id(pending_art_ready) = true; id(pending_art_error) = false;"
+          else:
+            # No transition in progress — apply immediately.
+            - lvgl.image.update:
+                id: album_art_widget
+                src: sendspin_album_art
+            - lvgl.obj.update:
+                id: album_art_widget
+                hidden: false
+            - lvgl.obj.update:
+                id: placeholder_icon
+                hidden: true
     on_image_error:
-      - lvgl.obj.update:
-          id: album_art_widget
-          hidden: true
-      - lvgl.obj.update:
-          id: placeholder_icon
-          hidden: false
+      - if:
+          condition:
+            lambda: "return id(is_transitioning);"
+          then:
+            - lambda: "id(pending_art_error) = true; id(pending_art_ready) = false;"
+          else:
+            - lvgl.obj.update:
+                id: album_art_widget
+                hidden: true
+            - lvgl.obj.update:
+                id: placeholder_icon
+                hidden: false
 
 media_source:
   - platform: sendspin
@@ -299,7 +329,9 @@ text_sensor:
       }
       return s;
     on_value:
-      - lambda: "arc_text::set_text(x.c_str());"
+      # Trigger the backlight transition; arc text and album art are applied
+      # inside the dark phase of track_change_transition, not here.
+      - script.execute: track_change_transition
 
 i2c:
   - id: bus_a
@@ -539,6 +571,86 @@ script:
           arc_text::set_stroke_visible(true);
           lv_obj_set_style_arc_opa(id(vol_arc), 0, LV_PART_MAIN);
           lv_obj_set_style_arc_opa(id(vol_arc), 0, LV_PART_INDICATOR);
+
+  # Backlight transition for track changes.
+  #
+  # Sequence:
+  #   1. Set is_transitioning and clear pending art flags.
+  #   2. Fade backlight to 0% over 500 ms.
+  #   3. Delay 500 ms — wait for backlight to reach zero.
+  #   4. Dark phase: apply all deferred UI updates:
+  #        - Arc text from the current now_playing_text sensor state.
+  #        - Album art (or placeholder) if on_image_decoded/error fired during fadeout.
+  #   5. lv_refr_now(NULL) — force LVGL to render and flush the full frame to the
+  #        display panel synchronously before the backlight comes back on.
+  #   6. Delay 50 ms — allow the display panel DMA transfer to complete.
+  #   7. Clear is_transitioning so future on_image_decoded calls apply immediately.
+  #   8. Fade backlight to 100% over 500 ms.
+  #
+  # mode: restart — rapid track skips restart the sequence cleanly. Pending flags
+  # are cleared on each restart so only the most recent art decode is applied.
+  - id: track_change_transition
+    mode: restart
+    then:
+      - lambda: |-
+          id(is_transitioning) = true;
+          id(pending_art_ready) = false;
+          id(pending_art_error) = false;
+      - light.turn_on:
+          id: Sled
+          brightness: 0%
+          transition_length: 500ms
+      - delay: 500ms
+
+      # ── Dark phase: apply all UI updates while screen is off ──────────────
+
+      # Arc text — read from the template sensor so the correct value is used
+      # even if the script was restarted mid-transition by a rapid skip.
+      - lambda: "arc_text::set_text(id(now_playing_text).state.c_str());"
+
+      # Album art decoded during the fadeout
+      - if:
+          condition:
+            lambda: "return id(pending_art_ready);"
+          then:
+            - lvgl.image.update:
+                id: album_art_widget
+                src: sendspin_album_art
+            - lvgl.obj.update:
+                id: album_art_widget
+                hidden: false
+            - lvgl.obj.update:
+                id: placeholder_icon
+                hidden: true
+            - lambda: "id(pending_art_ready) = false;"
+
+      # Art error during the fadeout
+      - if:
+          condition:
+            lambda: "return id(pending_art_error);"
+          then:
+            - lvgl.obj.update:
+                id: album_art_widget
+                hidden: true
+            - lvgl.obj.update:
+                id: placeholder_icon
+                hidden: false
+            - lambda: "id(pending_art_error) = false;"
+
+      # Force a synchronous LVGL render+flush so every pixel is committed to
+      # the display panel before the backlight turns on.
+      - lambda: "lv_refr_now(NULL);"
+
+      # Allow time for the display panel DMA transfer to complete.
+      - delay: 50ms
+
+      # Release the gate — on_image_decoded will now apply art directly again.
+      - lambda: "id(is_transitioning) = false;"
+
+      - light.turn_on:
+          id: Sled
+          brightness: 100%
+          transition_length: 500ms
 
   - id: knob_step_script
     mode: queued
