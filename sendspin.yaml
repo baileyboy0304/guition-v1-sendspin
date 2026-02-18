@@ -1,0 +1,830 @@
+substitutions:
+  name: esphome-web-d1e9b4
+  friendly_name: Waveshare Knob S3 Player
+  startup_sound_file: https://github.com/RealDeco/xiaozhi-esphome/raw/main/sounds/Home_Connected.flac
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.1.0
+  name_add_mac_suffix: false
+  includes:
+    - arc_text_lvgl_v8.h       # Canvas-free curved text renderer (PSRAM-backed lv_img)
+  platformio_options:
+    build_flags:
+      - -DLV_COLOR_SCREEN_TRANSP=1   # Required for transparent arc_text overlay
+      - -DLV_USE_SNAPSHOT=1
+  on_boot:
+    priority: -10
+    then:
+      - switch.turn_on: audio_bus_switch
+      - delay: 2s
+      - lvgl.page.show: page_boot
+      - script.execute: check_connection_status
+
+# ---------------------------------------------------------
+# ESP32-S3 TARGET
+# ---------------------------------------------------------
+esp32:
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"   # Run at 240 MHz
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"        # Larger data cache benefits PSRAM access
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"    # 64-byte cache lines improve burst reads
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: y         # Execute code from PSRAM where possible
+      CONFIG_SPIRAM_RODATA: y                     # Store read-only data in PSRAM
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+# ---------------------------------------------------------
+# EXTERNAL COMPONENTS
+# Audio pipeline components are pinned to specific git refs to ensure
+# reproducible builds while the upstream components are still in development.
+# ---------------------------------------------------------
+external_components:
+  - source:
+      type: git
+      url: https://github.com/esphome/esphome
+      ref: c28c97fbaf15c4ce353317e873054fb00a1d7a6d
+    components: [mixer]
+  - source:
+      type: git
+      url: https://github.com/esphome/esphome
+      ref: 298efb53400852a09e2f8bdf16feac9a58422059
+    components: [resampler]
+  - source:
+      type: git
+      url: https://github.com/esphome/esphome
+      ref: 9148832ea4e54907bad71a24d4ced1ce6c862433
+    components: [audio]
+  - source:
+      type: git
+      url: https://github.com/esphome/esphome
+      ref: bff22983a390352360796f8e1363127e0cd1f898
+    components: [media_player]
+  - source:
+      type: git
+      url: https://github.com/esphome/esphome
+      ref: 32708a2ee74f5ea4107448f62755004ad3e879c5
+    refresh: 0s
+    components: [file, http_request, media_source, speaker_source]
+
+  # Sendspin-specific PRs (runtime image support and Sendspin integration)
+  - source: github://pr#10212
+    components: [runtime_image, online_image]
+    refresh: 1h
+  - source: github://pr#12284
+    components: [generic_image, sendspin]
+    refresh: 0s
+
+  - source:
+      type: git
+      url: https://github.com/esphome/esphome
+      ref: 3cc894763b05ac8ffd9fdd15bcb549d47cadf6eb
+    components: [mdns]
+
+# ---------------------------------------------------------
+# SYSTEM & LOGGING
+# ---------------------------------------------------------
+logger:
+  level: DEBUG
+  logs:
+    text_sensor: WARN   # Suppress frequent now_playing update noise
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Knob Player"   # Fallback AP if the main network is unavailable
+
+api:
+  reboot_timeout: 0s    # Do not reboot if the HA API connection is lost
+  on_client_connected:
+    then:
+      # Play the startup sound once per boot when HA connects.
+      # The flag prevents re-playing if the API reconnects mid-session.
+      - lambda: |-
+          if (!id(boot_sound_played)) {
+            id(boot_sound_played) = true;
+            if (id(startup_sound_switch).state) {
+              id(play_sound)->execute(true, std::string("ready_sound"));
+            }
+          }
+      - script.execute: load_cached_for_selected
+
+ota:
+  - platform: esphome
+    id: ota_esphome
+
+http_request:
+captive_portal:
+
+# ---------------------------------------------------------
+# GLOBALS
+# ---------------------------------------------------------
+globals:
+  # Index of the currently selected Home Assistant device in the menu (0-3)
+  - id: selected_index
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  # Whether the device-selection menu is currently open
+  - id: in_menu
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+  # Touch gesture state
+  - id: touch_is_down
+    type: bool
+    initial_value: "false"
+  - id: touch_down_ms
+    type: uint32_t
+    initial_value: "0"
+  - id: touch_start_x
+    type: int
+    initial_value: "0"
+  - id: touch_start_y
+    type: int
+    initial_value: "0"
+
+  # Last volume value used to detect changes without polling the media player constantly
+  - id: last_known_volume
+    type: float
+    initial_value: "0.5"
+
+  # Cached control values for each selectable device, persisted across reboots
+  - id: cache_v1
+    type: float
+    restore_value: true
+    initial_value: "50"
+  - id: cache_v2
+    type: float
+    restore_value: true
+    initial_value: "50"
+
+  # Prevents the startup sound from playing more than once per boot
+  - id: boot_sound_played
+    type: bool
+    initial_value: "false"
+
+  # Set to true once the HA API connection is confirmed; used to gate page transitions
+  - id: is_connected_to_server
+    type: bool
+    initial_value: "false"
+
+# ---------------------------------------------------------
+# SWITCHES
+# ---------------------------------------------------------
+switch:
+  # Exposed to HA so the user can toggle the boot sound from the UI
+  - platform: template
+    id: startup_sound_switch
+    name: Startup sound
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  # Controls power to the I2S audio bus (GPIO0); kept on permanently
+  - platform: gpio
+    pin: GPIO0
+    id: audio_bus_switch
+    internal: true
+    restore_mode: ALWAYS_ON
+
+# ---------------------------------------------------------
+# AUDIO HARDWARE
+# I2S bus → external DAC (stereo, 48 kHz)
+# Audio is routed: source → resampler → mixer → i2s_audio speaker
+# Announcements and media share the mixer with separate resampler stages
+# so they can be played simultaneously at independent volumes.
+# ---------------------------------------------------------
+i2s_audio:
+  - id: i2s_audio_bus
+    i2s_lrclk_pin: GPIO40
+    i2s_bclk_pin: GPIO39
+
+speaker:
+  - platform: i2s_audio
+    id: box_speaker
+    i2s_audio_id: i2s_audio_bus
+    i2s_dout_pin: GPIO41
+    dac_type: external
+    channel: stereo
+    buffer_duration: 300ms
+
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: box_speaker
+    num_channels: 2
+    source_speakers:
+      - id: announcement_mixer_input
+      - id: media_mixer_input
+
+  - platform: resampler
+    id: media_resampling_input
+    output_speaker: media_mixer_input
+    sample_rate: 48000
+
+  - platform: resampler
+    id: announcement_resampling_input
+    output_speaker: announcement_mixer_input
+    sample_rate: 48000
+
+# ---------------------------------------------------------
+# MEDIA PLAYER
+# ---------------------------------------------------------
+sendspin:
+  id: sendspin_hub
+  task_stack_in_psram: true
+  kalman_process_error: 0.01
+
+# Album art: decoded by Sendspin, resized to fill the 360x360 display
+generic_image:
+  - platform: sendspin
+    id: sendspin_album_art
+    format: jpg
+    type: RGB565
+    resize: 360x360
+    image_source: ALBUM
+    on_image_decoded:
+      - lvgl.image.update:
+          id: album_art_widget
+          src: sendspin_album_art
+      - lvgl.obj.update:
+          id: album_art_widget
+          hidden: false
+      - lvgl.obj.update:
+          id: placeholder_icon
+          hidden: true
+      - logger.log: "Album art decoded successfully"
+    on_image_error:
+      - logger.log: "Failed to decode album art"
+      - lvgl.obj.update:
+          id: album_art_widget
+          hidden: true
+      - lvgl.obj.update:
+          id: placeholder_icon
+          hidden: false
+
+media_source:
+  - platform: sendspin
+    id: sendspin_source
+  - platform: http_request
+    id: http_source
+    buffer_size: 500000
+  - platform: file
+    id: file_source
+    files:
+      - id: ready_sound
+        file: ${startup_sound_file}
+
+media_player:
+  - platform: sendspin
+    id: sendspin_group_media_player
+
+  - platform: speaker_source
+    id: external_media_player
+    name: "Knob Player"
+    announcement_speaker: announcement_resampling_input
+    media_speaker: media_resampling_input
+    announcement_pipeline:
+      format: FLAC
+      num_channels: 1
+      sample_rate: 48000
+    media_pipeline:
+      format: FLAC
+      num_channels: 2
+      sample_rate: 48000
+    volume_increment: 0.05
+    sources:
+      - http_source
+      - sendspin_source
+      - file_source
+    on_play:
+      then:
+        - if:
+            condition:
+              lambda: "return id(is_connected_to_server);"
+            then:
+              - lvgl.page.show: page_main
+    on_pause:
+      then:
+        - if:
+            condition:
+              lambda: "return id(is_connected_to_server);"
+            then:
+              - lvgl.page.show: page_main
+
+# ---------------------------------------------------------
+# SENSORS & INPUTS (ROTARY KNOB)
+# GPIO7 = CCW pulse, GPIO8 = CW pulse, debounced at 2 ms
+# ---------------------------------------------------------
+binary_sensor:
+  - platform: gpio
+    id: dial_ccw_pulse
+    internal: true
+    pin:
+      number: GPIO7
+      mode: { input: true, pullup: true }
+    filters: [delayed_on_off: 2ms]
+    on_press:
+      then: [script.execute: { id: knob_step_script, direction: -1 }]
+
+  - platform: gpio
+    id: dial_cw_pulse
+    internal: true
+    pin:
+      number: GPIO8
+      mode: { input: true, pullup: true }
+    filters: [delayed_on_off: 2ms]
+    on_press:
+      then: [script.execute: { id: knob_step_script, direction: 1 }]
+
+# ---------------------------------------------------------
+# METADATA & NOW-PLAYING TEXT
+# ---------------------------------------------------------
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+text_sensor:
+  # Track title from Sendspin
+  - platform: sendspin
+    id: sendspin_title
+    type: title
+    on_value:
+      - component.update: now_playing_text
+
+  # Artist name from Sendspin
+  - platform: sendspin
+    id: sendspin_artist
+    type: artist
+    on_value:
+      - component.update: now_playing_text
+
+  # Combines title and artist into "Title - Artist" and pushes it to the arc renderer.
+  # Updated whenever either source value changes.
+  - platform: template
+    id: now_playing_text
+    update_interval: never
+    lambda: |-
+      std::string s = id(sendspin_title).get_state();
+      auto a = id(sendspin_artist).get_state();
+      if (!a.empty()) {
+        if (!s.empty()) s += " - ";
+        s += a;
+      }
+      return s;
+    on_value:
+      - lambda: |-
+          arc_text::set_text(x.c_str());
+
+# ---------------------------------------------------------
+# I2C (TOUCHSCREEN)
+# ---------------------------------------------------------
+i2c:
+  - id: bus_a
+    sda: GPIO11
+    scl: GPIO12
+    scan: true
+
+# ---------------------------------------------------------
+# CONTROL VALUE (MENU)
+# ---------------------------------------------------------
+number:
+  - platform: template
+    id: control_value
+    name: "Knob Control Value"
+    min_value: 0
+    max_value: 100
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 50
+
+# ---------------------------------------------------------
+# DISPLAY BACKLIGHT
+# ---------------------------------------------------------
+output:
+  - platform: ledc
+    pin: GPIO47   # LCD_BLK
+    id: backlight_output
+
+light:
+  - platform: monochromatic
+    id: Sled
+    name: Screen
+    entity_category: config
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+
+# ---------------------------------------------------------
+# DISPLAY (QSPI MIPI)
+# ---------------------------------------------------------
+spi:
+  id: display_qspi
+  type: quad
+  clk_pin: GPIO13
+  data_pins: [GPIO15, GPIO16, GPIO17, GPIO18]
+
+display:
+  - platform: mipi_spi
+    id: main_display
+    model: JC3636W518V2
+    rotation: 180
+    cs_pin: GPIO14
+    reset_pin: GPIO21
+    auto_clear_enabled: false
+    update_interval: never
+
+# ---------------------------------------------------------
+# TOUCHSCREEN (CST816)
+# ---------------------------------------------------------
+touchscreen:
+  - platform: cst816
+    id: my_touchscreen
+    interrupt_pin: GPIO9
+    reset_pin: GPIO10
+    display: main_display
+    on_touch:   { then: [script.execute: touch_down] }
+    on_release: { then: [script.execute: touch_up] }
+
+# ---------------------------------------------------------
+# FONTS
+# ---------------------------------------------------------
+font:
+  - file: "gfonts://Roboto"
+    id: roboto_28
+    size: 28
+  - file: "gfonts://Roboto"
+    id: roboto_52
+    size: 52
+  - file: "gfonts://Roboto"
+    id: roboto_80
+    size: 80
+  - file: "gfonts://Material Icons"
+    id: material_80
+    size: 80
+    glyphs: "\ue405"   # music_note
+  - file: "gfonts://Material Icons"
+    id: material_120
+    size: 120
+    glyphs: "\ue405"   # music_note (larger, for centre-screen placeholder)
+
+# ---------------------------------------------------------
+# IMAGES
+# ---------------------------------------------------------
+image:
+  - file: https://raw.githubusercontent.com/RealDeco/xiaozhi-esphome/main/images/Casita/240x240/playing.png
+    id: fallback_playing_image
+    resize: 360x360
+    type: RGB565
+
+# ---------------------------------------------------------
+# LVGL UI
+# ---------------------------------------------------------
+lvgl:
+  displays: [main_display]
+  touchscreens: [my_touchscreen]
+  buffer_size: 50%
+  color_depth: 16
+  bg_color: 0x000000
+
+  on_boot:
+    then:
+      - lambda: |-
+          // Initialise the arc text renderer inside its transparent container widget.
+          arc_text::init(id(arc_text_container));
+
+          // Configure for a bottom arc: text travels counter-clockwise so that
+          // glyphs read left-to-right, with tops facing inward (toward centre).
+          arc_text::Config c;
+          c.cx             = 180;
+          c.cy             = 180;
+          c.r_base         = 160.0f;
+          c.mid_deg        = 90.0f;   // centre of text at the bottom of the circle
+          c.clockwise      = false;
+          c.outward        = false;
+          c.extra_letter_px = 1.0f;
+          c.max_span_deg   = 320.0f;
+          c.ellipsize      = true;
+          arc_text::set_config(c);
+
+          arc_text::set_text("Ready");
+
+  pages:
+    # Boot page — shows a music note icon that turns green once HA connects
+    - id: page_boot
+      widgets:
+        - obj:
+            width: 100%
+            height: 100%
+            bg_color: 0x000000
+            pad_all: 0
+            border_width: 0
+            widgets:
+              - label:
+                  id: boot_icon_label
+                  align: CENTER
+                  text: "\ue405"         # Material Icons: music_note
+                  text_font: material_80
+                  text_color: 0xFF0000   # Red until HA connection is confirmed
+
+    # Main page — full-screen album art with arc text overlay and volume arc
+    - id: page_main
+      widgets:
+        - obj:
+            width: 100%
+            height: 100%
+            bg_color: 0x000000
+            pad_all: 0
+            border_width: 0
+            widgets:
+              # Album art fills the entire 360x360 screen.
+              # Hidden by default; shown when Sendspin provides decoded art.
+              - image:
+                  id: album_art_widget
+                  align: CENTER
+                  src: fallback_playing_image
+                  width: 360
+                  height: 360
+                  antialias: true
+                  opa: COVER
+                  hidden: true
+
+              # Placeholder music note shown when no album art is available
+              - label:
+                  id: placeholder_icon
+                  align: CENTER
+                  text: "\ue405"
+                  text_font: material_120
+                  text_color: 0x555555
+
+              # Transparent container for the arc text renderer.
+              # arc_text::init() creates a single lv_img child inside this object.
+              # The text_font set here is inherited by the renderer for glyph metrics.
+              - obj:
+                  id: arc_text_container
+                  width: 360
+                  height: 360
+                  align: CENTER
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  text_font: roboto_28
+                  text_color: 0xFFFFFF
+
+              # Volume arc overlay — hidden at rest, shown briefly when volume changes.
+              # Both arc_opa values start at 0 (invisible); show_volume_arc animates them.
+              - arc:
+                  id: vol_arc
+                  align: CENTER
+                  width: 340
+                  height: 340
+                  min_value: 0
+                  max_value: 100
+                  value: 50
+                  bg_opa: TRANSP
+                  arc_width: 10
+                  arc_color: 0xFFFFFF
+                  arc_opa: 0
+                  indicator:
+                    arc_width: 10
+                    arc_color: 0x00FF9F
+                    arc_opa: 0
+
+    # Menu page — device selector for Home Assistant control targets
+    - id: page_menu
+      widgets:
+        - obj:
+            width: 100%
+            height: 100%
+            bg_color: 0x000000
+            pad_all: 0
+            border_width: 0
+            widgets:
+              - label:
+                  align: TOP_MID
+                  y: 20
+                  text_font: roboto_28
+                  text_color: 0xFFFFFF
+                  text: "Control HA"
+              - label:
+                  id: menu_curr
+                  align: CENTER
+                  y: 0
+                  text_font: roboto_28
+                  text_color: 0x00FF9F   # Teal highlight for the selected device
+                  text: ""
+              - label:
+                  id: menu_val_disp
+                  align: CENTER
+                  y: 40
+                  text_font: roboto_52
+                  text_color: 0xFFFFFF
+                  text: "50"
+
+# ---------------------------------------------------------
+# INTERVALS
+# ---------------------------------------------------------
+interval:
+  # Poll until the HA connection is established, then move to the main page.
+  # The script sets is_connected_to_server = true, so this stops firing once done.
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: "return !id(is_connected_to_server);"
+          then:
+            - script.execute: check_connection_status
+
+  # Volume monitor — polls every 100 ms and updates the volume arc if the
+  # volume has changed by more than 1%.  Skipped while the menu is open.
+  - interval: 100ms
+    then:
+      - lambda: |-
+          if (id(in_menu)) return;
+          float current = id(external_media_player).volume;
+          float diff = current - id(last_known_volume);
+          if (diff < 0) diff = -diff;
+          if (diff > 0.01) {
+            id(last_known_volume) = current;
+            int v = (int)(current * 100);
+            lv_arc_set_value(id(vol_arc), v);
+            id(show_volume_arc).execute();
+          }
+
+# ---------------------------------------------------------
+# SCRIPTS & LOGIC
+# ---------------------------------------------------------
+script:
+  # Confirms HA connectivity, changes the boot icon to green, then transitions
+  # to the main page after a short delay.
+  - id: check_connection_status
+    then:
+      - lambda: |-
+          id(is_connected_to_server) = true;
+          lv_obj_set_style_text_color(id(boot_icon_label), lv_color_hex(0x00FF00), 0);
+      - delay: 1s
+      - lvgl.page.show: page_main
+
+  # Briefly shows the volume arc when the volume changes.
+  # The arc text stroke is hidden while the arc is visible to reduce visual
+  # clutter — both elements occupy the same ring of the display.
+  # mode: restart ensures rapid knob turns extend the display time rather than
+  # queuing multiple hide operations.
+  - id: show_volume_arc
+    mode: restart
+    then:
+      - lambda: |-
+          arc_text::set_stroke_visible(false);
+          lv_obj_set_style_arc_opa(id(vol_arc), 255, LV_PART_MAIN);
+          lv_obj_set_style_arc_opa(id(vol_arc), 255, LV_PART_INDICATOR);
+      - delay: 2s
+      - lambda: |-
+          arc_text::set_stroke_visible(true);
+          lv_obj_set_style_arc_opa(id(vol_arc), 0, LV_PART_MAIN);
+          lv_obj_set_style_arc_opa(id(vol_arc), 0, LV_PART_INDICATOR);
+
+  # Handles rotary knob steps.
+  # In menu mode: moves the device selection up or down.
+  # In normal mode: adjusts media player volume in 5% increments.
+  - id: knob_step_script
+    mode: queued
+    parameters:
+      direction: int
+    then:
+      - if:
+          condition:
+            lambda: "return id(in_menu);"
+          then:
+            - lambda: |-
+                int i = id(selected_index) + direction;
+                if (i < 0) i = 0;
+                if (i > 3) i = 3;
+                id(selected_index) = i;
+            - script.execute: load_cached_for_selected
+            - script.execute: ui_refresh
+          else:
+            - lambda: |-
+                auto *mp = id(external_media_player);
+                float new_vol = mp->volume + (direction * 0.05f);
+                if (new_vol < 0.0f) new_vol = 0.0f;
+                if (new_vol > 1.0f) new_vol = 1.0f;
+                mp->make_call().set_volume(new_vol).perform();
+
+  # Records the touch-down position and timestamp for gesture recognition.
+  - id: touch_down
+    then:
+      - lambda: |-
+          id(touch_is_down) = true;
+          id(touch_down_ms) = millis();
+          auto *ts = id(my_touchscreen);
+          auto tp_opt = ts->get_touch();
+          if (tp_opt.has_value()) {
+            id(touch_start_x) = tp_opt->x;
+            id(touch_start_y) = tp_opt->y;
+          }
+
+  # Classifies the completed touch gesture:
+  #   Long press (>800 ms, little horizontal movement) -> open device menu
+  #   Swipe right (>50 px)                             -> next track
+  #   Swipe left  (>50 px)                             -> previous track
+  #   Short tap                                        -> tap_action
+  - id: touch_up
+    then:
+      - lambda: |-
+          if (!id(touch_is_down)) return;
+          id(touch_is_down) = false;
+
+          auto *ts = id(my_touchscreen);
+          auto tp_opt = ts->get_touch();
+          if (!tp_opt.has_value()) return;
+          auto tp = *tp_opt;
+
+          int diff_x = tp.x - id(touch_start_x);
+          uint32_t duration = millis() - id(touch_down_ms);
+
+          if (duration > 800 && abs(diff_x) < 20) {
+            id(open_menu).execute();
+            return;
+          }
+
+          if (abs(diff_x) > 50) {
+            if (diff_x > 0) {
+              id(external_media_player)->make_call()
+                .set_command(media_player::MEDIA_PLAYER_COMMAND_NEXT).perform();
+            } else {
+              id(external_media_player)->make_call()
+                .set_command(media_player::MEDIA_PLAYER_COMMAND_PREVIOUS).perform();
+            }
+          } else {
+            id(tap_action).execute();
+          }
+
+  # Short tap behaviour:
+  #   In menu -> close menu and return to main page
+  #   Normal  -> toggle playback and briefly show the volume arc
+  - id: tap_action
+    then:
+      - if:
+          condition:
+            lambda: "return id(in_menu);"
+          then:
+            - script.execute: close_menu
+          else:
+            - media_player.toggle: external_media_player
+            - script.execute: show_volume_arc
+
+  - id: open_menu
+    then:
+      - lambda: "id(in_menu) = true;"
+      - lvgl.page.show: page_menu
+      - script.execute: ui_refresh
+
+  - id: close_menu
+    then:
+      - lambda: "id(in_menu) = false;"
+      - lvgl.page.show: page_main
+
+  # Refreshes the menu labels with the currently selected device name and value.
+  - id: ui_refresh
+    then:
+      - lvgl.label.update:
+          id: menu_curr
+          text: !lambda |-
+            static const char* NAMES[] = { "Dev 1", "Dev 2", "Dev 3", "Dev 4" };
+            int idx = id(selected_index);
+            if (idx >= 0 && idx < 4) return std::string(NAMES[idx]);
+            return std::string("");
+      - lvgl.label.update:
+          id: menu_val_disp
+          text: !lambda |-
+            return to_string((int)id(control_value).state);
+
+  # Loads the cached control value for the currently selected device and
+  # publishes it so the menu display and any HA automations stay in sync.
+  - id: load_cached_for_selected
+    then:
+      - lambda: |-
+          float v = 0;
+          if (id(selected_index) == 0)      v = id(cache_v1);
+          else if (id(selected_index) == 1) v = id(cache_v2);
+          id(control_value).publish_state(v);
+
+  # Plays a sound file through the announcement pipeline.
+  # priority is reserved for future pre-emption logic.
+  - id: play_sound
+    parameters:
+      priority: bool
+      sound_file: string
+    then:
+      - media_player.play_media:
+          id: external_media_player
+          media_url: !lambda 'return "file://" + sound_file;'
